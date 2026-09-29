@@ -1,6 +1,7 @@
 # Pinned for the RAGMAP container. torch/torchvision come from the cu121 index
 # (see the Dockerfile); everything else from PyPI. numpy stays < 2 because
-# torch 2.3.1 and opencv 4.10 wheels are built against numpy 1.x.
+# opencv 4.10 wheels are built against numpy 1.x. torch is 2.4.1: the vendored
+# LightGlue uses torch.amp.custom_fwd(device_type=...), which 2.3 lacks.
 numpy==1.26.4
 scipy==1.13.1
 opencv-python==4.10.0.84

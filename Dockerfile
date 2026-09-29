@@ -34,8 +34,8 @@ RUN apt-get update \
 
 COPY ragmap_adapter/requirements.txt /tmp/requirements.txt
 RUN pip install --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple \
-        torch==2.3.1 torchvision==0.18.1 \
-    && printf 'torch==2.3.1\ntorchvision==0.18.1\n' > /tmp/constraints.txt \
+        torch==2.4.1 torchvision==0.19.1 \
+    && printf 'torch==2.4.1\ntorchvision==0.19.1\n' > /tmp/constraints.txt \
     && pip install --constraint /tmp/constraints.txt -r /tmp/requirements.txt
 
 WORKDIR /opt/object-rel-nav
