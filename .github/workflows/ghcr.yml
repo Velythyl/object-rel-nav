@@ -1,0 +1,76 @@
+name: Publish object-rel-nav image
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/velythyl/object-rel-nav
+
+jobs:
+  docker-amd64:
+    runs-on: ubuntu-22.04
+    outputs:
+      sha_tag: ${{ steps.sha.outputs.tag }}
+    steps:
+      # The CUDA PyTorch wheels make a ~6 GB image; the stock runner has ~14 GB free.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/.ghcup /usr/share/swift "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Short SHA tag
+        id: sha
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - name: Build and publish CUDA image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            OBJECT_REL_NAV_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=object-rel-nav-cuda-amd64
+          cache-to: type=gha,mode=max,scope=object-rel-nav-cuda-amd64,ignore-error=true
+
+      - name: Disk usage after build
+        if: always()
+        run: df -h /
