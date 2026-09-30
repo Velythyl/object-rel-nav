@@ -12,6 +12,11 @@ cross-trajectory segment associations, with the LightGlue keypoints supporting
 each one. RAGMAP's `robohop_alignment` scene-alignment module lifts those to 3-D
 and fits a planar transform between the trajectories.
 
+A trajectory may name a `graph` pickle this adapter wrote earlier for exactly the
+same images and mapper settings; it is then loaded instead of re-mapped (RAGMAP
+caches maps this way), and FastSAM is loaded only when some trajectory still
+needs mapping.
+
 Upstream code is not modified. The contract (`ragmap.segment_graph/v1`) and
 every adapter decision are documented in `ragmap_adapter/run.py`'s docstring.
 

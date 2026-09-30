@@ -15,10 +15,13 @@ never edited.
 INPUT (``/input``, read-only)::
 
     meta.json    {"schema": "ragmap.segment_graph/v1",
-                  "trajectories": [{"id", "images": "<dir>", "frames": "<dir>/frames.jsonl"}],
+                  "trajectories": [{"id", "images": "<dir>", "frames": "<dir>/frames.jsonl",
+                                    "graph": "<dir>/graph.pickle" (optional)}],
                   "pairs": [{"source", "target", "queries": [map_index, ...]}]}
     <dir>/frames.jsonl   {"map_index", "frame_index", "frame_id", "image"} per map image
     <dir>/images/000000.jpg ...   the map images, in map order (``map_index``)
+    <dir>/graph.pickle   optional: a graph pickle this adapter wrote for exactly
+                         these images and mapper settings (see 6. below)
 
 OUTPUT (``/output``)::
 
@@ -74,6 +77,16 @@ What the adapter does, and all it does:
 5. **Keypoints are recorded, not recomputed.** A subclass of ``MatchLightGlue``
    forwards every call unchanged and keeps the matched keypoints
    ``matchPair_imgWithMask`` computed from the same features and matches.
+6. **Precomputed maps.** A trajectory whose record names a ``graph`` is not
+   re-mapped: that pickle is loaded exactly as upstream's own
+   ``MapTopological.load_graph`` loads a precomputed graph (``pickle.load``),
+   and the image list is derived as ``MapTopological.__init__`` derives it.
+   The mapper pickles ``G4`` and uses that same object afterwards, so a map
+   loaded back is the graph a fresh run would localize against. RAGMAP uses
+   this to cache maps across runs (the caller keys the pickle by image sha,
+   mapper overrides and the exact frames); the segmentor is loaded only when
+   some trajectory still has to be mapped. Its rows in ``nodes.jsonl`` and
+   ``edges.jsonl`` are emitted from the loaded graph as for a fresh map.
 """
 from __future__ import annotations
 
@@ -155,6 +168,7 @@ class _Trajectory:
             if line.strip()
         ]
         self.frames.sort(key=lambda frame: int(frame["map_index"]))
+        self.precomputed_graph = input_dir / record["graph"] if record.get("graph") else None
         self.work = output_dir / self.id
         self.images = self.work / "images"
         self.graph = None
@@ -182,6 +196,43 @@ def _build_map(trajectory: _Trajectory, segmentor: Any, cfg: dict[str, Any]) -> 
     trajectory.image_paths = list(mapper.imgNames)
     trajectory.node_image = np.array([trajectory.graph.nodes[n]["map"][0] for n in trajectory.graph.nodes()])
     return {"seconds": time.monotonic() - started, "graph": mapper.graphPath}
+
+
+def _load_map(trajectory: _Trajectory, cfg: dict[str, Any]) -> dict[str, Any]:
+    """A precomputed map: upstream's graph pickle, and the image list the mapper would list."""
+
+    import pickle
+    import shutil
+
+    import numpy as np
+    from libs.mapper.map_topo import MapTopological
+    from natsort import natsorted
+
+    trajectory.work.mkdir(parents=True, exist_ok=True)
+    if not trajectory.images.exists():
+        os.symlink(trajectory.input_images, trajectory.images, target_is_directory=True)
+    started = time.monotonic()
+    # `MapTopological.__init__`'s image list and subsampling, without loading
+    # its segmentor and matcher (neither is used once the graph exists).
+    settings = {**MapTopological.default_config(None), **cfg}
+    names = [f"{trajectory.images}/{name}" for name in natsorted(os.listdir(f"{trajectory.images}"))]
+    names = names[settings["subsample_si"]:settings["subsample_ei"]:settings["subsample_step"]]
+    if len(names) != len(trajectory.frames):
+        raise RuntimeError(f"{trajectory.id}: {len(names)} images but {len(trajectory.frames)} frames listed")
+    # Where `MapTopological` writes it (`h5FullPath`, `graphPath`), so the
+    # output tree is the one a fresh map leaves.
+    h5 = f"{trajectory.work}/nodes_{settings['segmentor_name']}.h5"
+    if len(settings["textLabels"]) > 0:
+        h5 = f"{h5[:-3]}_filteredByText.h5"
+    graph_path = f"{h5[:-3]}_graphObject_4_{settings['matcher_name']}.pickle"
+    shutil.copyfile(trajectory.precomputed_graph, graph_path)
+    with open(graph_path, "rb") as handle:  # `MapTopological.load_graph`
+        trajectory.graph = pickle.load(handle)
+    trajectory.image_paths = names
+    trajectory.node_image = np.array([trajectory.graph.nodes[n]["map"][0] for n in trajectory.graph.nodes()])
+    if len(trajectory.node_image) and int(trajectory.node_image.max()) >= len(names):
+        raise RuntimeError(f"{trajectory.id}: the precomputed graph names images beyond the {len(names)} listed")
+    return {"seconds": time.monotonic() - started, "graph": graph_path}
 
 
 def _graph_rows(trajectory: _Trajectory) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -376,18 +427,23 @@ def run(input_dir: Path, output_dir: Path, overrides: dict[str, dict[str, Any]])
     release_localizer = _release_localizer_cfg()
     timings: dict[str, Any] = {}
     started = time.monotonic()
-    # `create_maps_hm3d.py` builds one segmentor and hands it to every map.
-    segmentor = model_loader.get_segmentor(
-        mapper_cfg["segmentor_name"], mapper_cfg["W"], mapper_cfg["H"], mapper_cfg["device"],
-        path_models=mapper_cfg.get("modelPath"),
-    )
-    timings["segmentor_load"] = time.monotonic() - started
     trajectories = {record["id"]: _Trajectory(record, input_dir, output_dir) for record in meta["trajectories"]}
+    segmentor = None
+    if any(trajectory.precomputed_graph is None for trajectory in trajectories.values()):
+        # `create_maps_hm3d.py` builds one segmentor and hands it to every map.
+        segmentor = model_loader.get_segmentor(
+            mapper_cfg["segmentor_name"], mapper_cfg["W"], mapper_cfg["H"], mapper_cfg["device"],
+            path_models=mapper_cfg.get("modelPath"),
+        )
+        timings["segmentor_load"] = time.monotonic() - started
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     maps: dict[str, Any] = {}
     for trajectory in trajectories.values():
-        info = _build_map(trajectory, segmentor, mapper_cfg)
+        if trajectory.precomputed_graph is not None:
+            info = _load_map(trajectory, mapper_cfg)
+        else:
+            info = _build_map(trajectory, segmentor, mapper_cfg)
         trajectory_nodes, trajectory_edges = _graph_rows(trajectory)
         nodes += trajectory_nodes
         edges += trajectory_edges
@@ -396,6 +452,7 @@ def run(input_dir: Path, output_dir: Path, overrides: dict[str, dict[str, Any]])
             "intra_image_edges": sum(1 for edge in trajectory_edges if edge["kind"] == "intra_image"),
             "temporal_edges": sum(1 for edge in trajectory_edges if edge["kind"] == "temporal"),
             "graph_pickle": str(Path(info["graph"]).relative_to(output_dir)),
+            "precomputed": trajectory.precomputed_graph is not None,
         }
         timings[f"map:{trajectory.id}"] = info["seconds"]
     localizations: list[dict[str, Any]] = []
